@@ -16,10 +16,24 @@ import (
 )
 
 var (
-	telegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
-	telegramChatID   = os.Getenv("TELEGRAM_CHAT_ID")
-	dbFile           = "data.db"
+	dbFile = "data.db"
 )
+
+type Config struct {
+	TelegramToken  string `json:"telegram_token"`
+	TelegramChatID string `json:"telegram_chat_id"`
+	SlackWebhook   string `json:"slack_webhook"`
+}
+
+func loadConfig() Config {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatalf("Không đọc được config.json: %v", err)
+	}
+	var cfg Config
+	json.Unmarshal(data, &cfg)
+	return cfg
+}
 
 var coins = []string{"bitcoin", "ethereum", "binancecoin"}
 
@@ -97,12 +111,12 @@ func savePrices(db *sql.DB, prices map[string]float64) error {
 }
 
 // === TELEGRAM ===
-func sendTelegramMessage(text string) error {
-	if telegramBotToken == "" || telegramChatID == "" {
+func sendTelegramMessage(cfg Config, text string) error {
+	if cfg.TelegramToken == "" || cfg.TelegramChatID == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
 	}
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramBotToken)
-	body := fmt.Sprintf(`{"chat_id":"%s","text":%q}`, telegramChatID, text)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.TelegramToken)
+	body := fmt.Sprintf(`{"chat_id":"%s","text":%q}`, cfg.TelegramChatID, text)
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		return err
@@ -115,8 +129,27 @@ func sendTelegramMessage(text string) error {
 	return nil
 }
 
+// === SLACK ===
+func sendSlackMessage(cfg Config, text string) error {
+	if cfg.SlackWebhook == "" {
+		return nil
+	}
+	payload := map[string]string{"text": text}
+	body, _ := json.Marshal(payload)
+	resp, err := http.Post(cfg.SlackWebhook, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("slack returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // === HELPER ===
-func formatMessage(prices map[string]float64) string {
+func formatMessage(prices map[string]float64, lastPrices map[string]float64) string {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf("📊 *Crypto Prices (USD)*\nTime: %s\n", now)
 	for _, c := range coins {
@@ -126,6 +159,9 @@ func formatMessage(prices map[string]float64) string {
 			"binancecoin": "BNB",
 		}[c]
 		msg += fmt.Sprintf("\n%s: $%.2f", symbol, prices[c])
+		if lastPrices[c] > 0 {
+			msg += fmt.Sprintf(" Change: %.2f$", prices[c]-lastPrices[c])
+		}
 	}
 	return msg
 }
@@ -133,6 +169,7 @@ func formatMessage(prices map[string]float64) string {
 // === MAIN ===
 func main() {
 	log.Println("Starting crypto tracker...")
+	cfg := loadConfig()
 
 	db, err := initDB()
 	if err != nil {
@@ -140,6 +177,7 @@ func main() {
 	}
 	defer db.Close()
 
+	var lastPrices map[string]float64
 	runJob := func() {
 		prices, err := fetchPrices()
 		if err != nil {
@@ -152,12 +190,16 @@ func main() {
 			return
 		}
 
-		msg := formatMessage(prices)
-		if err := sendTelegramMessage(msg); err != nil {
+		msg := formatMessage(prices, lastPrices)
+		lastPrices = prices
+		if err := sendTelegramMessage(cfg, msg); err != nil {
 			log.Printf("telegram error: %v", err)
-			return
 		}
-		log.Println("Pushed prices successfully!")
+
+		if err := sendSlackMessage(cfg, msg); err != nil {
+			log.Printf("slack error: %v", err)
+		}
+		log.Println("✅ Prices pushed successfully!")
 	}
 
 	runJob()
